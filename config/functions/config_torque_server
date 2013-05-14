@@ -1,0 +1,236 @@
+##############################################################################
+# Copyright (c) Members of the EGEE Collaboration. 2004.
+# See http://www.eu-egee.org/partners/ for details on the copyright
+# holders.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+##############################################################################
+#
+# NAME :        config_torque_server
+#
+# DESCRIPTION : This function configures the torque batch system.
+#               
+#
+# AUTHORS :     Nuno.Orestes.Vaz.da.Silva@cern.ch
+#		Gergely.Debreczeni@cern.ch
+#		Robert.Harakaly@cern.ch
+#
+# NOTES :       - Does not automatically support several CE's 
+#
+# YAIM MODULE:  glite-yaim-torque-server
+#
+##############################################################################
+
+config_torque_server_check () {
+
+  requires $1 BATCH_SERVER WN_LIST QUEUES __GROUP_ENABLE CE_SMPSIZE CE_HOST CONFIG_TORQUE_NODES
+
+  if (( "$CE_SMPSIZE" >= 0 )) ; then
+      :
+  else
+      YAIMLOG WARNING "CE_SMPSIZE should be an integer number, but it is '$CE_SMPSIZE'"
+  fi
+}
+                                                                                                                             
+config_torque_server_setenv () {
+
+  yaimlog INFO "Currently this function doesn't set any environment variables."
+
+}
+
+config_torque_server () {
+
+
+  if [ -z "${TORQUE_VAR_DIR}" ]; then
+    yaimlog DEBUG "TORQUE_VAR_DIR not set"
+    if [ -d "/var/lib/torque" ]; then
+      yaimlog DEBUG "Using /var/lib/torque"
+      TORQUE_VAR_DIR="/var/lib/torque"
+    else
+      if [ -d "/var/torque" ]; then
+        yaimlog DEBUG "Using /var/torque"
+        TORQUE_VAR_DIR="/var/torque"
+      else
+         yaimlog ERROR "And not found /var/torque nor /var/lib/torque"
+         exit 1
+      fi   
+    fi
+  else
+    yaimlog DEBUG "TORQUE_VAR_DIR is set"
+    TORQUE_VAR_DIR=${TORQUE_VAR_DIR}
+  fi
+
+
+  yaimlog DEBUG "Add all the pbs services..."
+  ####@ Add all the pbs services... 
+  if [ "x`grep pbs /etc/services`" = "x" ]; then
+    cat << EOF  >> /etc/services
+pbs		15001/tcp
+pbs_mom         15002/tcp
+pbs_resmon       15003/tcp
+pbs_resmon       15003/udp
+EOF
+  fi
+  yaimlog DEBUG "Define the batch server name"
+  ####@ Define the batch server name
+  echo $BATCH_SERVER > $TORQUE_VAR_DIR/server_name
+
+  if [ "x${CONFIG_TORQUE_NODES}" = "xyes" ]; then
+     
+    yaimlog DEBUG "Create the node list"
+    ####@ Create the node list
+    if [ -f $TORQUE_VAR_DIR/server_priv/nodes ]; then
+      yaimlog DEBUG "Saving the existing nodes configuration"
+      mv $TORQUE_VAR_DIR/server_priv/nodes $TORQUE_VAR_DIR/server_priv/nodes.old
+    fi
+
+    for node in `cat $WN_LIST `; do 
+      echo "$node np=$CE_SMPSIZE lcgpro" >> $TORQUE_VAR_DIR/server_priv/nodes 
+    done
+  else
+    yaimlog INFO "$TORQUE_VAR_DIR/server_priv/nodes won't be configured by YAIM since CONFIG_TORQUE_NODES=no"
+  fi
+
+
+    yaimlog DEBUG "(Re)start the torque server" 
+    ####@ (Re)start the torque server
+    yaimlog INFO "Re-starting the torque server"
+    /etc/rc.d/init.d/pbs_server stop || true
+    /etc/rc.d/init.d/pbs_server start
+    if [ $? -ne 0 ] ; then
+      yaimlog ERROR "pbs_server returned an error code!"
+      return 1
+    fi
+        
+    yaimlog DEBUG "Create the pbs queues"
+    ####@ Create the pbs queues
+    for que in `echo $QUEUES | sed 's/"//g'` ; 
+    do 
+      existing_queues=`qstat -Q | cut -f 1 -d " "`
+      isexist=0
+      for eque in $existing_queues; 
+      do
+        if [ $eque = $que ]; then
+          isexist=1
+       	fi
+      done
+
+      if [ $isexist -eq 0 ]; then
+        yaimlog DEBUG "Creating queue: $que"
+	/usr/bin/qmgr <<EOF 
+create queue $que
+EOF
+      else
+        yaimlog DEBUG "Queue \"$que\" already exists, it won't be created."
+      fi
+    done
+
+/usr/bin/qmgr <<EOF 
+set server scheduling = True
+set server acl_host_enable = False
+set server managers = root@`hostname -f`
+set server operators = root@`hostname -f` 
+set server default_queue = dteam
+set server log_events = 511
+set server mail_from = adm
+set server mail_domain = never
+set server query_other_jobs = True
+set server scheduler_iteration = 600
+set server default_node = lcgpro
+set server node_pack = False
+set server kill_delay = 10
+set server authorized_users = *@$CE_HOST
+EOF
+
+  for QUEUE in `echo $QUEUES | sed 's/"//g'` ; 
+  do 
+    /usr/bin/qmgr <<EOF 
+set queue $QUEUE queue_type = Execution 
+set queue $QUEUE resources_max.cput = 48:00:00 
+set queue $QUEUE resources_max.walltime = 72:00:00 
+set queue $QUEUE enabled = True 
+set queue $QUEUE started = True 
+set queue $QUEUE acl_group_enable = True 
+EOF
+
+  dnssafevar=`echo $QUEUE | sed -e 's/[\.-]/_/g' |  tr '[:lower:]' '[:upper:]'`
+  qenablevar=${dnssafevar}_GROUP_ENABLE
+
+  if [ "${!qenablevar}" ] ; then
+  for vomsgroup in ${!qenablevar}; 
+  do 
+    skipp="false"
+    unixgroup=`users_getvogroup $vomsgroup`       
+    retval=$?
+    if [ $retval -ne 0 ]; then
+      yaimlog WARNING "$FUNCNAME: No unix group found for VO (or VOMS FQAN): \"$vomsgroup\". Skipping."
+      skipp="true"
+    fi
+
+    if [ "$skipp" == "false" ]; then 
+      yaimlog DEBUG "Mapping: $vomsgroup --> $unixgroup"
+      if ( ! qmgr -c "list queue $QUEUE acl_groups" | awk '/acl_groups/,EOF {print $NF}'|grep -qwi $unixgroup ); then
+        yaimlog DEBUG "Adding acl_groups += $unixgroup to queue ${QUEUE}."
+        /usr/bin/qmgr -c "set queue $QUEUE acl_groups += $unixgroup"
+      fi
+    fi
+  done
+  else
+    yaimlog WARNING "$FUNCNAME: Group access is not defined for queue: $QUEUE"
+  fi
+
+  done
+
+  # Make sure the pbs_server survives a reboot
+  /sbin/chkconfig pbs_server on
+
+  /etc/rc.d/init.d/pbs_server restart
+  yaimlog DEBUG "zip server log"
+  ###@ zip server logs
+  cron_job server_logs root "33 3 * * * root find $TORQUE_VAR_DIR/server_logs -mtime +7 -exec gzip -9 {} \; 2> /dev/null"
+        
+  ###@ If the torque server is on a separate machine from the CE, allow communication between them
+  if [ "x${BATCH_SERVER}" != "x${CE_HOST}" ]; then
+    yaimlog DEBUG "Allow communication between TORQUE server and CE"
+    if ( ! grep -q ${CE_HOST} /etc/hosts.equiv 2> /dev/null ); then
+      echo ${CE_HOST} >>  /etc/hosts.equiv
+    fi
+  ####@ Install the munge key and start munge
+
+    if [ ! -z "$MUNGE_KEY_FILE" ]; then
+	if [ ! -f "$MUNGE_KEY_FILE" ]; then
+	    yestr $YEX_NOSUCHFILE
+	    yaimlog ERROR "The munge key file $MUNGE_KEY_FILE is not found"
+	    exit $YEX_NOSUCHFILE
+	fi
+	if [ ! -f /etc/munge/munge.key ] ; then
+	    yaimlog DEBUG "installing $MUNGE_KEY_FILE in /etc/munge/munge.key"
+	    cp $MUNGE_KEY_FILE /etc/munge/munge.key
+	    chmod 400 /etc/munge/munge.key
+	    chown munge /etc/munge/munge.key
+	fi
+    fi
+
+    if [ ! -f /etc/munge/munge.key ] ; then
+	yaimlog WARNING "The munge key /etc/munge/munge.key does not exist."
+	yaimlog WARNING "Munge is required for communication between torque server and submitters."
+	yaimlog WARNING "Not starting the munge daemon"
+    else
+	/etc/init.d/munge start || yaimlog DEBUG "Could not start munge (already running?)"
+	/sbin/chkconfig munge on
+    fi
+
+  fi
+	
+  return 0
+}
