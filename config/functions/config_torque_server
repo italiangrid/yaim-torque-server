@@ -113,9 +113,14 @@ EOF
     fi
         
     yaimlog DEBUG "Create the pbs queues"
+    default_queue=""
     ####@ Create the pbs queues
     for que in `echo $QUEUES | sed 's/"//g'` ; 
     do 
+      if [ "x${default_queue}" == "x" ] ; then
+        default_queue=que
+      fi
+      
       existing_queues=`qstat -Q | cut -f 1 -d " "`
       isexist=0
       for eque in $existing_queues; 
@@ -140,7 +145,7 @@ set server scheduling = True
 set server acl_host_enable = False
 set server managers = root@`hostname -f`
 set server operators = root@`hostname -f` 
-set server default_queue = dteam
+set server default_queue = ${default_queue}
 set server log_events = 511
 set server mail_from = adm
 set server mail_domain = never
